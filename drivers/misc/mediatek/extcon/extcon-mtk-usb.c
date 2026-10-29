@@ -203,9 +203,14 @@ static int mtk_usb_extcon_set_vbus(struct mtk_extcon_info *extcon,
 		return 0;
 
 	dev_info(dev, "vbus turn %s\n", is_on ? "on" : "off");
-	ret = usb_set_property(USB_PROP_OTG_ENABLE, is_on);
-	if (ret < 0)
-		dev_info(dev, "failed to set otg enable\n");
+	/*
+	 * Do not drive the charger's OTG state from here: otg_enable_set()
+	 * cancels usb_otg_monitor_work, and cancelling that work while it is
+	 * running busy-waits in try_to_grab_pending(), spinning this worker
+	 * forever and stalling every later USB role switch.  The charger
+	 * framework already learns the OTG/VBUS state from its own TCPC
+	 * notifier registration.
+	 */
 
 	if (is_on) {
 		if (extcon->vbus_vol) {
@@ -241,6 +246,14 @@ static int mtk_usb_extcon_set_vbus(struct mtk_extcon_info *extcon,
 }
 
 #if IS_ENABLED(CONFIG_TCPC_CLASS)
+static void mtk_usb_extcon_vbus_work(struct work_struct *work)
+{
+	struct mtk_extcon_info *extcon = container_of(to_delayed_work(work),
+					struct mtk_extcon_info, vbus_work);
+
+	mtk_usb_extcon_set_vbus(extcon, extcon->vbus_target);
+}
+
 static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 		unsigned long event, void *data)
 {
@@ -255,7 +268,14 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 		dev_info(dev, "source vbus = %dmv\n",
 				 noti->vbus_state.mv);
 		vbus_on = (noti->vbus_state.mv) ? true : false;
-		mtk_usb_extcon_set_vbus(extcon, vbus_on);
+		/*
+		 * Do not touch the charger from the TCPC notify worker: that
+		 * path ends in cancel_delayed_work_sync() on the charger's OTG
+		 * monitor work and spins this worker forever, so every later
+		 * TCPC notification is never delivered.
+		 */
+		extcon->vbus_target = vbus_on;
+		queue_delayed_work(extcon->extcon_wq, &extcon->vbus_work, 0);
 		break;
 	case TCP_NOTIFY_TYPEC_STATE:
 		dev_info(dev, "old_state=%d, new_state=%d\n",
@@ -469,6 +489,7 @@ static int mtk_usb_extcon_probe(struct platform_device *pdev)
 			"mediatek,bypss-typec-sink");
 
 	extcon->extcon_wq = create_singlethread_workqueue("extcon_usb");
+	INIT_DELAYED_WORK(&extcon->vbus_work, mtk_usb_extcon_vbus_work);
 	if (!extcon->extcon_wq)
 		return -ENOMEM;
 

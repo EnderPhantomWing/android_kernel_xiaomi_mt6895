@@ -25,6 +25,11 @@ struct mtk_extcon_info {
 	struct gpio_desc *id_gpiod;
 	unsigned int id_irq;
 	struct delayed_work wq_detcable;
+	/* VBUS is switched from its own work item: the TCPC notify
+	 * callback must not synchronously cancel charger work.
+	 */
+	struct delayed_work vbus_work;
+	bool vbus_target;
 };
 
 struct usb_role_info {
