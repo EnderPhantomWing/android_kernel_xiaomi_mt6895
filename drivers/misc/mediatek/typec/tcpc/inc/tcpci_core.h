@@ -381,6 +381,10 @@ struct tcpc_device {
 	bool typec_power_ctrl;
 	bool typec_watchdog;
 	bool typec_reach_vsafe0v;
+	/* Set while our own source VBUS is being released and has not
+	 * been observed as gone yet; suppresses no-Rp-source detection.
+	 */
+	bool typec_vbus_released;
 	bool typec_is_attached_src;
 
 	int typec_usb_sink_curr;

@@ -368,6 +368,17 @@ static int typec_check_water_status(struct tcpc_device *tcpc)
 #if CONFIG_TYPEC_CAP_NORP_SRC
 static bool typec_try_enter_norp_src(struct tcpc_device *tcpc)
 {
+	/*
+	 * VBUS may still be present right after we stop supplying it ourselves:
+	 * the rail has not discharged yet, while CC is already open.  That looks
+	 * identical to an external source without an Rp pull-up, but entering
+	 * Attached.NoRpSRC keeps VBUS enabled, so the state could never be left
+	 * again and every later charger/cable plug would go undetected until a
+	 * reboot.  Skip the check until VBUS is seen as gone.
+	 */
+	if (tcpc->typec_vbus_released)
+		return false;
+
 	if (tcpci_check_vbus_valid_from_ic(tcpc) &&
 	    typec_is_cc_no_res() &&
 	    tcpc->typec_state == typec_unattached_snk) {
@@ -532,6 +543,7 @@ static void typec_unattached_power_entry(struct tcpc_device *tcpc)
 	typec_wait_ps_change(tcpc, TYPEC_WAIT_PS_DISABLE);
 
 	if (tcpc->typec_power_ctrl) {
+		tcpc->typec_vbus_released = true;
 		tcpci_set_vconn(tcpc, false);
 		tcpci_disable_vbus_control(tcpc);
 		tcpci_report_power_control(tcpc, false);
@@ -624,8 +636,15 @@ static void typec_unattached_entry(struct tcpc_device *tcpc)
 
 	tcpc->typec_usb_sink_curr = CONFIG_TYPEC_SNK_CURR_DFT;
 
-	if (tcpc->typec_power_ctrl)
+	if (tcpc->typec_power_ctrl) {
+		/*
+		 * Set before the no-Rp-source check below runs: our own VBUS has
+		 * not discharged yet, so it must not be mistaken for an external
+		 * source without Rp pull-up.
+		 */
+		tcpc->typec_vbus_released = true;
 		tcpci_set_vconn(tcpc, false);
+	}
 	typec_unattached_cc_entry(tcpc);
 	typec_unattached_power_entry(tcpc);
 }
@@ -2087,6 +2106,8 @@ int tcpc_typec_handle_cc_change(struct tcpc_device *tcpc)
 		typec_wait_ps_change(tcpc, TYPEC_WAIT_PS_DISABLE);
 
 	if (typec_is_cc_attach(tcpc)) {
+		/* An external source/sink is present: our VBUS is long gone. */
+		tcpc->typec_vbus_released = false;
 		typec_disable_low_power_mode(tcpc);
 		typec_attach_wait_entry(tcpc);
 		if ((tcpc->tcpc_flags & TCPC_FLAGS_TYPEC_OTP) &&
@@ -2554,6 +2575,10 @@ static inline int typec_handle_vbus_absent(struct tcpc_device *tcpc)
 int tcpc_typec_handle_ps_change(struct tcpc_device *tcpc, int vbus_level)
 {
 	tcpc->typec_reach_vsafe0v = false;
+
+	/* Our own source VBUS is finally gone: no-Rp detection may resume. */
+	if (vbus_level < TCPC_VBUS_VALID)
+		tcpc->typec_vbus_released = false;
 
 #if CONFIG_TYPEC_CHECK_LEGACY_CABLE
 	if (tcpc->typec_legacy_cable) {
