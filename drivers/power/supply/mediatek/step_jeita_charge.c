@@ -190,7 +190,15 @@ static void monitor_usb_otg_burn(struct work_struct *work)
 		usbotg_enable_otg(info, true);
 		chr_err("%s:enable otg\n", __func__);
 	}
-	schedule_delayed_work(&info->usb_otg_monitor_work, msecs_to_jiffies(otg_monitor_delay_time));
+	/*
+	 * Only keep monitoring while OTG is actually enabled.  Re-arming
+	 * unconditionally leaves this delayed work permanently pending, which
+	 * makes cancel_delayed_work*() in otg_enable_set() spin forever in
+	 * try_to_grab_pending() and stalls the USB role switch workqueue.
+	 */
+	if (info->otg_enable)
+		schedule_delayed_work(&info->usb_otg_monitor_work,
+				      msecs_to_jiffies(otg_monitor_delay_time));
 }
 
 #if defined(CONFIG_TARGET_PRODUCT_ARISTOTLE)
