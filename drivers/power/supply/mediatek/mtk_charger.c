@@ -4468,7 +4468,10 @@ static int otg_enable_set(struct mtk_charger *gm,
 		else
 		{
 			gm->typec_otg_burn = false;
-			cancel_delayed_work_sync(&gm->usb_otg_monitor_work);
+			/* Non-blocking: this work re-arms itself, a sync cancel
+			 * here can spin forever against the USB role switch.
+			 */
+			cancel_delayed_work(&gm->usb_otg_monitor_work);
 		}
 	}
 	else if(gm->product_name == RUBENS || gm->product_name == XAGA || gm->product_name == XAGAPRO || gm->product_name == DAUMIER || gm->product_name == ARISTOTLE)
@@ -4478,7 +4481,10 @@ static int otg_enable_set(struct mtk_charger *gm,
 		else
 		{
 			gm->typec_otg_burn = false;
-			cancel_delayed_work_sync(&gm->usb_otg_monitor_work);
+			/* Non-blocking: this work re-arms itself, a sync cancel
+			 * here can spin forever against the USB role switch.
+			 */
+			cancel_delayed_work(&gm->usb_otg_monitor_work);
 		}
 	}
 	chr_err("%s %d\n", __func__, gm->otg_enable);
