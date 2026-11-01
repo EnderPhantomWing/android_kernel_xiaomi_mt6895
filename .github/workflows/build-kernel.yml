@@ -1,0 +1,376 @@
+name: Compile Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_version:
+        description: Type the clang version of ur kernel
+        required: true
+        type: choice
+        options:
+          - clang-3289846
+          - clang-r547379
+          - clang-r563880
+          - clang-r563880c
+          - clang-r574158
+          - clang-stable
+
+      kernel_source:
+        description: Kernel Source Code Owner (e.g., EnderPhantomWing)
+        required: true
+        type: string
+        default: "EnderPhantomWing"
+
+      kernel_branch:
+        description: Kernel Branch (e.g., lineage-23.2)
+        required: true
+        type: string
+        default: "lineage-23.2"
+
+      ksu_type:
+        description: "KernelSU Version"
+        required: true
+        type: choice
+        options:
+          - None
+          - Official-KernelSU
+          - KernelSU-Next
+          - KowSU
+          - BakaSU
+
+      susfs:
+        description: "Add susfs support"
+        required: true
+        type: boolean
+        default: false
+
+      BBG:
+        description: "Add BBG support"
+        required: true
+        type: boolean
+        default: false
+
+      rekernel:
+        description: "Add Re-Kernel support"
+        required: true
+        type: boolean
+        default: false
+
+      droidspaces:
+        description: "Add DroidSpaces support"
+        required: true
+        type: boolean
+        default: false
+
+      ccache_update:
+        description: "Refresh ccache"
+        required: true
+        type: boolean
+        default: false
+
+
+jobs:
+  Kernel_CI:
+    env:
+        GH_TOKEN: ${{ github.token }}
+        SOC: mt6895                       # 仓库名使用 mt6895（芯片为 MT6896，平台同 MT6895）
+        CCACHE_KEY: ccache-ecsv3-pearl-mt6895
+        TG_GROUP_URL: "https://t.me/huangdihdskernelbuilds"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      checks: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SWAP
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+          bc bison flex libssl-dev libelf-dev libdw-dev \
+          build-essential lz4 git python3 curl dwarves cpio ccache zstd gcc-aarch64-linux-gnu
+
+      - name: Clone Kernel Source
+        run: |
+          # MTK 内核仓库，无需 -modules 仓库
+          git clone --depth=1 -b ${{ inputs.kernel_branch }} \
+            https://github.com/${{ inputs.kernel_source }}/android_kernel_xiaomi_${SOC}.git ${SOC}
+
+      - name: Download AOSP Clang
+        run: |
+          set +e
+          mkdir -p toolchains/${{ inputs.clang_version }}
+          cd toolchains
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/${{ inputs.clang_version }}.tar.gz"
+          TARBALL="${{ inputs.clang_version }}.tar.gz"
+          ok=0
+          for i in $(seq 1 8); do
+            echo "==> Downloading clang (attempt $i/8)..."
+            rm -f "$TARBALL"
+            curl -L --fail --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 -o "$TARBALL" "$URL"
+            rc=$?
+            sz=$(stat -c%s "$TARBALL" 2>/dev/null || echo 0)
+            if [ "$rc" -eq 0 ] && gzip -t "$TARBALL" 2>/dev/null; then
+              echo "==> Valid tarball (${sz} bytes), extracting..."
+              tar -xf "$TARBALL" -C "${{ inputs.clang_version }}" && { ok=1; break; }
+            fi
+            echo "!! attempt $i failed (curl rc=$rc, size=${sz} bytes)"
+            sleep 20
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::clang download failed after 8 attempts"
+            exit 1
+          fi
+
+      # ---- ccache-ECS ----
+      # 通过 outputs 显式导出，避免 "Context access might be invalid" 报错
+      - name: Configure ccache dir and key
+        id: ccache-config
+        run: |
+          CCACHE_DIR_VAL="$HOME/.ccache_pearl"
+          if [[ "${{ inputs.droidspaces }}" == true ]]; then
+            CCACHE_REAL_KEY_VAL="${CCACHE_KEY}-Droidspaces"
+          else
+            CCACHE_REAL_KEY_VAL="${CCACHE_KEY}-none"
+          fi
+          echo "CCACHE_DIR=${CCACHE_DIR_VAL}" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
+          echo "CCACHE_REAL_KEY=${CCACHE_REAL_KEY_VAL}" >> $GITHUB_ENV
+          # 导出给后续 steps.<id>.outputs.* 使用
+          echo "CCACHE_DIR=${CCACHE_DIR_VAL}" >> $GITHUB_OUTPUT
+          echo "CCACHE_REAL_KEY=${CCACHE_REAL_KEY_VAL}" >> $GITHUB_OUTPUT
+
+      - name: Purge old ccache (on refresh)
+        if: ${{ inputs.ccache_update }}
+        continue-on-error: true
+        run: |
+          gh cache delete "${{ steps.ccache-config.outputs.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ inputs.kernel_branch }}" -R ${{ github.repository }} || true
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        id: ccache-restore
+        with:
+          path: ${{ steps.ccache-config.outputs.CCACHE_DIR }}
+          key: ${{ steps.ccache-config.outputs.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ inputs.kernel_branch }}
+          restore-keys: |
+            ${{ steps.ccache-config.outputs.CCACHE_REAL_KEY }}-${{ runner.os }}-
+            ${{ steps.ccache-config.outputs.CCACHE_REAL_KEY }}-
+
+      - name: Compile Kernel
+        run: |
+          CLANG_ROOT="${GITHUB_WORKSPACE}/toolchains/${{ inputs.clang_version }}/bin"
+          export PATH="${CLANG_ROOT}:$PATH"
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+          export CC="${CLANG_ROOT}/clang" CXX="${CLANG_ROOT}/clang++"
+          export HOSTCC="${CLANG_ROOT}/clang" HOSTCXX="${CLANG_ROOT}/clang++"
+          export LD="${CLANG_ROOT}/ld.lld" AR="${CLANG_ROOT}/llvm-ar" NM="${CLANG_ROOT}/llvm-nm"
+          export OBJCOPY="${CLANG_ROOT}/llvm-objcopy" OBJDUMP="${CLANG_ROOT}/llvm-objdump" STRIP="${CLANG_ROOT}/llvm-strip"
+
+          # ccache-ECS tuning
+          export CCACHE_COMPILERCHECK="none"
+          export CCACHE_BASEDIR="${GITHUB_WORKSPACE}"
+          export CCACHE_NOHASHDIR="true"
+          mkdir -p "${CCACHE_DIR}"
+          echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros" >> "${CCACHE_DIR}/ccache.conf"
+          ccache -M "${CCACHE_MAXSIZE}"
+          ccache -o compression=true
+          echo "ccache status before build:"
+          ccache -s
+
+          # ---------- KERNEL_NAME 拼接 ----------
+          KERNEL_NAME="${{ inputs.ksu_type }}"
+          [[ "${{ inputs.susfs }}"      == true ]] && KERNEL_NAME="${KERNEL_NAME}-susfs"
+          [[ "${{ inputs.BBG }}"        == true ]] && KERNEL_NAME="${KERNEL_NAME}-BBG"
+          [[ "${{ inputs.rekernel }}"   == true ]] && KERNEL_NAME="${KERNEL_NAME}-rekernel"
+          [[ "${{ inputs.droidspaces }}" == true ]] && KERNEL_NAME="${KERNEL_NAME}-droidspaces"
+          echo "KERNEL_NAME=${KERNEL_NAME}" >> $GITHUB_ENV
+
+          cd ${SOC}
+
+          # ---------- KernelSU 系列 ----------
+          case "${{ inputs.ksu_type }}" in
+            "None") ;;
+            "Official-KernelSU")
+              curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main ;;
+            "KowSU")
+              curl -LSs "https://raw.githubusercontent.com/KOWX712/KernelSU/main/kernel/setup.sh" | bash -s master ;;
+            "KernelSU-Next")
+              if [[ "${{ inputs.susfs }}" == true ]]; then
+                curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+              else
+                curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s dev
+              fi ;;
+            "BakaSU")
+              curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash ;;
+          esac
+
+          # ---------- SUSFS ----------
+          if [[ "${{ inputs.susfs }}" == true ]]; then
+            git clone -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+            cd susfs
+            cp ./kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ..
+            cp ./kernel_patches/fs/* ../fs/
+            cp ./kernel_patches/include/linux/* ../include/linux/
+            cd ..
+            patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch
+
+            echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/gki_defconfig
+          fi
+
+          # ---------- BBG ----------
+          if [[ "${{ inputs.BBG }}" == true ]]; then
+            wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+            echo "CONFIG_BBG=y" >> arch/arm64/configs/gki_defconfig
+            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+          fi
+
+          # ---------- Re-Kernel ----------
+          if [[ "${{ inputs.rekernel }}" == true ]]; then
+            git clone --depth=1 https://github.com/Sakion-Team/Re-Kernel.git rekernel-src
+            bash rekernel-src/Integrate/patches.sh
+            echo "CONFIG_REKERNEL=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_REKERNEL_NETWORK=n" >> arch/arm64/configs/gki_defconfig
+          fi
+
+          # ---------- DroidSpaces (MT6896 同为 5.10) ----------
+          DROIDSPACES_CONFIG=""
+          if [[ "${{ inputs.droidspaces }}" == true ]]; then
+            curl -Lo patch-for-below-6.12.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/refs/heads/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+            patch -p1 < patch-for-below-6.12.patch
+            curl -Lo patch-for-5.10-or-lower.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/refs/heads/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
+            patch -p1 < patch-for-5.10-or-lower.patch
+            cp ${GITHUB_WORKSPACE}/configs/droidspaces-gki.config arch/arm64/configs/vendor/droidspaces.config
+            DROIDSPACES_CONFIG="vendor/droidspaces.config"
+          fi
+
+          echo "-${KERNEL_NAME}-${{ github.actor }}" > .scmversion
+          echo "CONFIG_TMPFS_XATTR=y" >> arch/arm64/configs/gki_defconfig
+
+          # ---------- Defconfig：gki → 平台(xiaomi_mt6895) → 设备(pearl) ----------
+          make O=out gki_defconfig vendor/xiaomi_mt6895.config vendor/pearl.config ${DROIDSPACES_CONFIG}
+
+          # ---------- 编译 ----------
+          make -j2 O=out \
+            CC="ccache ${CLANG_ROOT}/clang" \
+            HOSTCC="ccache ${CLANG_ROOT}/clang" \
+            Image
+
+          echo "ccache status after build:"
+          ccache -s
+
+      - name: Save ccache
+        if: ${{ always() && steps.ccache-restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.ccache-config.outputs.CCACHE_DIR }}
+          key: ${{ steps.ccache-config.outputs.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ inputs.kernel_branch }}
+
+      - name: Make AnyKernel3
+        run: |
+          ZIP_NAME="${KERNEL_NAME}_$(date -u +"%Y%m%d_%H%M")"
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          git clone --depth=1 https://github.com/KernelSU-Next/AnyKernel3.git
+          cp ${SOC}/out/arch/arm64/boot/Image AnyKernel3/Image
+          cp ${SOC}/out/arch/arm64/boot/Image ./Image
+          cd AnyKernel3
+          zip -r9 ../"${ZIP_NAME}.zip" * -x .git
+
+      - name: Create GitHub Release
+        run: |
+          BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
+          REL_NAME="${SOC}_${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-${KERNEL_NAME}-${BUILD_TIME}"
+          echo "REL_NAME=${REL_NAME}" >> $GITHUB_ENV
+          cd ${GITHUB_WORKSPACE}
+          ZIP_FILE=$(ls *.zip)
+
+          [[ "${{ inputs.susfs }}"      == true ]] && susfs_checkbox="Supported"      || susfs_checkbox="Unsupported"
+          [[ "${{ inputs.BBG }}"        == true ]] && bbg_checkbox="Supported"        || bbg_checkbox="Unsupported"
+          [[ "${{ inputs.rekernel }}"   == true ]] && rekernel_checkbox="Supported"   || rekernel_checkbox="Unsupported"
+          [[ "${{ inputs.droidspaces }}" == true ]] && droidspaces_checkbox="Supported" || droidspaces_checkbox="Unsupported"
+
+          gh release create "$REL_NAME" --title "$REL_NAME" --notes "# Unofficial kernel for Xiaomi Redmi Note 12T Pro (pearl)
+          | feature       | value                       |
+          | ------------- | --------------------------- |
+          | Device        | Redmi Note 12T Pro (pearl)  |
+          | Platform      | MT6896 / MT6895             |
+          | Kernel source | ${{ inputs.kernel_source }} |
+          | Kernel branch | ${{ inputs.kernel_branch }} |
+          | Kernel name   | ${KERNEL_NAME}              |
+          | Build time    | ${BUILD_TIME}               |
+          | KSU type      | ${{ inputs.ksu_type }}      |
+          | SUSFS         | ${susfs_checkbox}           |
+          | BBG patch     | ${bbg_checkbox}             |
+          | Re-Kernel     | ${rekernel_checkbox}        |
+          | DroidSpaces   | ${droidspaces_checkbox}     |
+          " "${ZIP_FILE}" Image
+
+      - name: Send Telegram Notification
+        if: success()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::group::Telegram Notification"
+
+          if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+            echo "Telegram secrets not configured (TG_BOT_TOKEN / TG_CHAT_ID). Skipping."
+            exit 0
+          fi
+
+          label() { if [ "$1" = "true" ]; then echo "Supported"; else echo "Unsupported"; fi; }
+          SUSFS_L=$(label "${{ inputs.susfs }}")
+          BBG_L=$(label "${{ inputs.BBG }}")
+          REKERNEL_L=$(label "${{ inputs.rekernel }}")
+          DROIDSPACES_L=$(label "${{ inputs.droidspaces }}")
+
+          REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ env.REL_NAME }}"
+
+          MSG_TEXT="🚀 <b>Redmi Note 12T Pro (pearl) Kernel Build Successful!</b>
+          ━━━━━━━━━━━━━━━━━━
+          <b>🏷️ Release Tag:</b> <code>${{ env.REL_NAME }}</code>
+          <b>🧬 Source:</b> ${{ inputs.kernel_source }} / ${{ inputs.kernel_branch }}
+          <b>🔐 Root Solution:</b> ${{ inputs.ksu_type }}
+          <b>🛡️ SUSFS:</b> ${SUSFS_L}
+          <b>📡 Baseband-guard:</b> ${BBG_L}
+          <b>🔁 Re-Kernel:</b> ${REKERNEL_L}
+          <b>🌐 DroidSpaces:</b> ${DROIDSPACES_L}
+          ━━━━━━━━━━━━━━━━━━
+          👉 <a href=\"${REL_URL}\"><b>📥 GET YOUR KERNEL HERE</b></a>
+          📢 <a href=\"${TG_GROUP_URL}\"><b>JOIN TELEGRAM GROUP</b></a>"
+
+          if [[ "$TG_CHAT_ID" == *:* ]]; then
+            ID="${TG_CHAT_ID%%:*}"
+            THREAD="${TG_CHAT_ID##*:}"
+          else
+            ID="$TG_CHAT_ID"
+            THREAD=""
+          fi
+          PAYLOAD=$(jq -n --arg chat_id "$ID" --arg text "$MSG_TEXT" --arg thread "$THREAD" \
+            '{chat_id:$chat_id, parse_mode:"HTML", disable_web_page_preview:true, text:$text}
+             + (if $thread != "" then {message_thread_id: ($thread|tonumber)} else {} end)')
+          echo "Sending to chat $ID${THREAD:+ (topic $THREAD)} ..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" -d "$PAYLOAD")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "Sent to $ID${THREAD:+ topic $THREAD}"
+          else
+            echo "::warning::Telegram push failed for $ID (HTTP $HTTP_CODE): $BODY"
+          fi
+          echo "::endgroup::"
